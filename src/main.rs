@@ -106,7 +106,7 @@ fn print_banner(export_path: &Path) {
     println!(
         "{} {}",
         accent_bullet(),
-        accent("chatgpt-reader is warming up")
+        accent("chatlogs-reader is warming up")
     );
     println!(
         "{} {}",
@@ -150,10 +150,10 @@ where
 
 fn main() -> Result<()> {
     let mut args = env::args_os();
-    let _ = args.next(); // executable name
+    let _ = args.next();
 
     let Some(export_arg) = args.next() else {
-        eprintln!("Usage: chatgpt-reader <path-to-export>");
+        eprintln!("Usage: chatlogs-reader <path-to-export>");
         std::process::exit(64);
     };
 
@@ -203,45 +203,169 @@ fn run(export_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_conversations(path: &Path) -> Result<Vec<ConversationRecord>> {
+fn load_conversations(path: &Path) -> Result<Vec<Conversation>> {
     let file_path = path.join("conversations.json");
-    let file = fs::File::open(&file_path)
-        .with_context(|| format!("opening conversations file at {file_path:?}"))?;
-    let conversations: Vec<ConversationRecord> =
-        serde_json::from_reader(file).with_context(|| "parsing conversations.json")?;
+    if !file_path.exists() {
+        return Err(anyhow!(
+            "expected conversations.json in `{}`",
+            path.display()
+        ));
+    }
+
+    let raw = fs::read_to_string(&file_path).with_context(|| format!("reading {file_path:?}"))?;
+    let json: Value = serde_json::from_str(&raw).with_context(|| "parsing conversations.json")?;
+    let items = json
+        .as_array()
+        .ok_or_else(|| anyhow!("expected top-level array in conversations.json"))?;
+
+    let kind = detect_export_kind(items)?;
+    match kind {
+        ExportKind::ChatGpt => parse_chatgpt_conversations(&raw),
+        ExportKind::Claude => parse_claude_conversations(&raw),
+    }
+}
+
+fn detect_export_kind(items: &[Value]) -> Result<ExportKind> {
+    let Some(sample) = items.iter().find_map(|value| value.as_object()) else {
+        return Err(anyhow!(
+            "could not detect export format: no conversation objects found"
+        ));
+    };
+
+    if sample.contains_key("mapping") {
+        Ok(ExportKind::ChatGpt)
+    } else if sample.contains_key("chat_messages") {
+        Ok(ExportKind::Claude)
+    } else {
+        Err(anyhow!("unrecognised conversation schema"))
+    }
+}
+
+fn parse_chatgpt_conversations(raw: &str) -> Result<Vec<Conversation>> {
+    let records: Vec<ChatGptConversationRecord> =
+        serde_json::from_str(raw).with_context(|| "decoding ChatGPT conversation schema")?;
+
+    let mut conversations = Vec::with_capacity(records.len());
+    for record in records {
+        let created_at = record.create_time.and_then(timestamp_from_f64);
+        let id = record.id.clone();
+        let title = record
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("(untitled conversation)")
+            .to_string();
+        let messages = extract_chatgpt_messages(&record);
+        conversations.push(Conversation {
+            id,
+            title,
+            created_at,
+            messages,
+        });
+    }
+
     Ok(conversations)
 }
 
-fn build_summaries(conversations: &[ConversationRecord]) -> Vec<ConversationSummary> {
+fn parse_claude_conversations(raw: &str) -> Result<Vec<Conversation>> {
+    let records: Vec<ClaudeConversationRecord> =
+        serde_json::from_str(raw).with_context(|| "decoding Claude conversation schema")?;
+
+    let mut conversations = Vec::with_capacity(records.len());
+    for record in records {
+        let created_at = record.created_at.as_deref().and_then(parse_rfc3339);
+        let title = record
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| record.summary.as_deref())
+            .unwrap_or("(untitled conversation)")
+            .to_string();
+
+        let messages = record
+            .chat_messages
+            .into_iter()
+            .filter_map(|message| {
+                let role = normalize_role(message.sender.as_str());
+                let text = message
+                    .text
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| text.to_string())
+                    .or_else(|| aggregate_claude_content(&message.content));
+                text.map(|content| Message { role, content })
+            })
+            .collect();
+
+        conversations.push(Conversation {
+            id: record.uuid,
+            title,
+            created_at,
+            messages,
+        });
+    }
+
+    Ok(conversations)
+}
+
+fn aggregate_claude_content(segments: &[ClaudeContent]) -> Option<String> {
+    let mut parts = Vec::new();
+    for segment in segments {
+        match segment.kind.as_str() {
+            "text" => {
+                if let Some(text) = segment.text.as_deref() {
+                    if !text.trim().is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            other => parts.push(format!("[{other} content]")),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+fn normalize_role(role: &str) -> String {
+    match role.to_lowercase().as_str() {
+        "human" | "user" => "user".to_string(),
+        "assistant" => "assistant".to_string(),
+        "system" => "system".to_string(),
+        "tool" => "tool".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn build_summaries(conversations: &[Conversation]) -> Vec<ConversationSummary> {
     let mut summaries: Vec<_> = conversations
         .iter()
         .enumerate()
-        .map(|(idx, convo)| ConversationSummary {
+        .map(|(idx, conversation)| ConversationSummary {
             index: idx,
-            id: convo.id.clone(),
-            title: convo
-                .title
-                .as_deref()
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or("(untitled conversation)")
-                .to_string(),
-            create_time: convo.create_time,
+            id: conversation.id.clone(),
+            title: if conversation.title.trim().is_empty() {
+                "(untitled conversation)".to_string()
+            } else {
+                conversation.title.clone()
+            },
+            created_at: conversation.created_at,
         })
         .collect();
 
     summaries.sort_by(|a, b| {
-        let a_time = a.create_time.unwrap_or(f64::MAX);
-        let b_time = b.create_time.unwrap_or(f64::MAX);
-        a_time
-            .partial_cmp(&b_time)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let a_key = a.created_at.map(|dt| dt.timestamp()).unwrap_or(i64::MIN);
+        let b_key = b.created_at.map(|dt| dt.timestamp()).unwrap_or(i64::MIN);
+        b_key.cmp(&a_key).then_with(|| a.index.cmp(&b.index))
     });
 
     summaries
 }
 
 fn browse_conversations(
-    conversations: &[ConversationRecord],
+    conversations: &[Conversation],
     summaries: &[ConversationSummary],
 ) -> Result<()> {
     loop {
@@ -249,7 +373,7 @@ fn browse_conversations(
             "{}",
             dim("type to filter titles, press Enter to list all, q to exit.")
         );
-        print!("\n{} ", accent_prompt("search>"));
+        print!("{} ", accent_prompt("search>"));
         io::stdout().flush()?;
         let input = read_line()?;
         let trimmed = input.trim();
@@ -287,29 +411,28 @@ fn browse_conversations(
 
         println!("\n{}", pastel_rule());
         println!("{} {}", accent_bullet(), accent(&summary.title));
-        if let Some(created) = summary.create_time.and_then(format_timestamp) {
+        if let Some(created) = summary.created_at.map(format_timestamp) {
             println!("{} {}", accent_bullet(), dim(&format!("started {created}")));
         }
         println!("{} {}", accent_bullet(), dim(&format!("id {}", summary.id)));
         println!("{}", pastel_rule());
 
-        let messages = extract_conversation_messages(conversation);
-        if messages.is_empty() {
+        if conversation.messages.is_empty() {
             println!("{}", dim("[no printable messages in this conversation]"));
         } else {
-            for message in messages {
-                let rendered_content = render_markdown(&message.content);
+            for message in &conversation.messages {
+                let rendered = render_markdown(&message.content);
                 match message.role.as_str() {
                     "user" => {
-                        let content = colorize_user_text(&rendered_content);
+                        let content = colorize_user_text(&rendered);
                         println!("\n{}{}", user_prefix(), content);
                     }
                     "assistant" => {
-                        println!("\n{}", rendered_content);
+                        println!("\n{}", rendered);
                     }
                     other => {
                         let tag = accent(&format!("[{}] ", other.to_uppercase()));
-                        let content = dim(&rendered_content);
+                        let content = dim(&rendered);
                         println!("\n{}{}", tag, content);
                     }
                 }
@@ -351,11 +474,11 @@ fn show_matches(matches: &[MatchedConversation<'_>]) -> usize {
         accent(&format!("found {} conversation(s).", matches.len()))
     );
 
-    for (ordinal, matched) in matches.iter().enumerate() {
+    for (ordinal, matched) in matches.iter().enumerate().rev() {
         let summary = matched.summary;
         let timestamp = summary
-            .create_time
-            .and_then(format_timestamp)
+            .created_at
+            .map(format_timestamp)
             .unwrap_or_else(|| "unknown time".to_string());
         println!(
             "{} [{}] {} {}",
@@ -400,7 +523,100 @@ fn prompt_match_choice(count: usize) -> Result<Option<usize>> {
     }
 }
 
-fn extract_conversation_messages(convo: &ConversationRecord) -> Vec<MessageView> {
+fn read_line() -> Result<String> {
+    let mut buf = String::new();
+    let bytes = io::stdin().read_line(&mut buf)?;
+    if bytes == 0 {
+        Err(anyhow!("input closed"))
+    } else {
+        Ok(buf)
+    }
+}
+
+fn timestamp_from_f64(ts: f64) -> Option<DateTime<Utc>> {
+    if !ts.is_finite() {
+        return None;
+    }
+    let seconds = ts.trunc() as i64;
+    let fraction = (ts - seconds as f64).clamp(0.0, 0.999_999_999_9);
+    let mut nanos = (fraction * 1_000_000_000.0).round() as u32;
+    if nanos >= 1_000_000_000 {
+        nanos = 999_999_999;
+    }
+    DateTime::<Utc>::from_timestamp(seconds, nanos)
+}
+
+fn parse_rfc3339(input: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(input)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+}
+
+fn format_timestamp(dt: DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+#[derive(Debug)]
+struct Conversation {
+    id: String,
+    title: String,
+    created_at: Option<DateTime<Utc>>,
+    messages: Vec<Message>,
+}
+
+#[derive(Debug)]
+struct Message {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug)]
+struct ConversationSummary {
+    index: usize,
+    id: String,
+    title: String,
+    created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+struct MatchedConversation<'a> {
+    summary: &'a ConversationSummary,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptConversationRecord {
+    id: String,
+    title: Option<String>,
+    create_time: Option<f64>,
+    current_node: Option<String>,
+    mapping: HashMap<String, ChatGptConversationNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptConversationNode {
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    message: Option<ChatGptMessageRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptMessageRecord {
+    #[serde(default)]
+    author: Option<ChatGptMessageAuthor>,
+    #[serde(default)]
+    create_time: Option<f64>,
+    #[serde(default)]
+    content: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptMessageAuthor {
+    #[serde(default)]
+    role: Option<String>,
+}
+
+fn extract_chatgpt_messages(convo: &ChatGptConversationRecord) -> Vec<Message> {
     let mut ordered_ids = Vec::new();
     let mut visited = HashSet::new();
 
@@ -418,14 +634,13 @@ fn extract_conversation_messages(convo: &ConversationRecord) -> Vec<MessageView>
         }
         ordered_ids.reverse();
     } else {
-        // Fallback: include every node with a timestamp, sorted chronologically.
         let mut nodes: Vec<_> = convo
             .mapping
             .iter()
             .filter_map(|(id, node)| {
                 node.message
                     .as_ref()
-                    .and_then(|m| m.create_time)
+                    .and_then(|message| message.create_time)
                     .map(|ts| (id.clone(), ts))
             })
             .collect();
@@ -441,14 +656,13 @@ fn extract_conversation_messages(convo: &ConversationRecord) -> Vec<MessageView>
                     .author
                     .as_ref()
                     .and_then(|author| author.role.as_deref())
-                    .unwrap_or("unknown")
-                    .to_string();
+                    .unwrap_or("unknown");
                 if let Some(text) = extract_text(&message.content) {
                     if text.trim().is_empty() {
                         continue;
                     }
-                    messages.push(MessageView {
-                        role,
+                    messages.push(Message {
+                        role: normalize_role(role.as_ref()),
                         content: text,
                     });
                 }
@@ -457,6 +671,36 @@ fn extract_conversation_messages(convo: &ConversationRecord) -> Vec<MessageView>
     }
 
     messages
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeConversationRecord {
+    uuid: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    chat_messages: Vec<ClaudeChatMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeChatMessage {
+    sender: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    content: Vec<ClaudeContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeContent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 fn extract_text(value: &Option<Value>) -> Option<String> {
@@ -517,97 +761,7 @@ fn extract_text(value: &Option<Value>) -> Option<String> {
     }
 }
 
-fn format_timestamp(ts: f64) -> Option<String> {
-    if !ts.is_finite() {
-        return None;
-    }
-    let seconds = ts.trunc() as i64;
-    let fraction = (ts - seconds as f64).clamp(0.0, 0.999_999_999_9);
-    let mut nanos = (fraction * 1_000_000_000.0).round() as u32;
-    if nanos >= 1_000_000_000 {
-        nanos = 999_999_999;
-    }
-    let datetime = DateTime::<Utc>::from_timestamp(seconds, nanos)?;
-    Some(datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-}
-
-fn read_line() -> Result<String> {
-    let mut buf = String::new();
-    let bytes = io::stdin().read_line(&mut buf)?;
-    if bytes == 0 {
-        Err(anyhow!("input closed"))
-    } else {
-        Ok(buf)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ConversationRecord {
-    id: String,
-    title: Option<String>,
-    create_time: Option<f64>,
-    current_node: Option<String>,
-    mapping: HashMap<String, ConversationNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConversationNode {
-    #[serde(default)]
-    parent: Option<String>,
-    #[serde(default)]
-    message: Option<MessageRecord>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MessageRecord {
-    #[serde(default)]
-    author: Option<MessageAuthor>,
-    #[serde(default)]
-    create_time: Option<f64>,
-    #[serde(default)]
-    content: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MessageAuthor {
-    #[serde(default)]
-    role: Option<String>,
-}
-
-#[derive(Debug)]
-struct ConversationSummary {
-    index: usize,
-    id: String,
-    title: String,
-    create_time: Option<f64>,
-}
-
-#[derive(Debug)]
-struct MatchedConversation<'a> {
-    summary: &'a ConversationSummary,
-}
-
-#[derive(Debug)]
-struct MessageView {
-    role: String,
-    content: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InlineStyle {
-    Bold,
-    Italic,
-    Heading,
-    BlockQuote,
-}
-
-#[derive(Clone, Debug)]
-enum ListState {
-    Unordered,
-    Ordered(u64),
-}
-
-static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(|| SyntaxSet::load_defaults_newlines());
+static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
 static THEME: Lazy<Theme> = Lazy::new(|| {
     let theme_set = ThemeSet::load_defaults();
     theme_set
@@ -774,6 +928,20 @@ fn render_markdown(text: &str) -> String {
     output.trim_end().to_string()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineStyle {
+    Bold,
+    Italic,
+    Heading,
+    BlockQuote,
+}
+
+#[derive(Clone, Debug)]
+enum ListState {
+    Unordered,
+    Ordered(u64),
+}
+
 fn pop_style(stack: &mut Vec<InlineStyle>, style: InlineStyle) {
     if let Some(index) = stack.iter().rposition(|entry| *entry == style) {
         stack.remove(index);
@@ -851,4 +1019,9 @@ fn highlight_code_block(code: &str, language: Option<&str>) -> String {
     }
 
     highlighted
+}
+
+enum ExportKind {
+    ChatGpt,
+    Claude,
 }
