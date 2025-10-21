@@ -73,20 +73,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "chatlogs-reader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "nu-ansi-term",
- "once_cell",
- "pulldown-cmark",
- "serde",
- "serde_json",
- "syntect",
-]
-
-[[package]]
 name = "chrono"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -97,6 +83,20 @@ dependencies = [
  "num-traits",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "convos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "nu-ansi-term",
+ "once_cell",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "syntect",
 ]
 
 [[package]]

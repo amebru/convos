@@ -103,11 +103,7 @@ fn style_frame(frame: &str) -> String {
 
 fn print_banner(export_path: &Path) {
     println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
-    println!(
-        "{} {}",
-        accent_bullet(),
-        accent("chatlogs-reader is warming up")
-    );
+    println!("{} {}", accent_bullet(), accent("convos is warming up"));
     println!(
         "{} {}",
         accent_bullet(),
@@ -153,7 +149,7 @@ fn main() -> Result<()> {
     let _ = args.next();
 
     let Some(export_arg) = args.next() else {
-        eprintln!("Usage: chatlogs-reader <path-to-export>");
+        eprintln!("Usage: convos <path-to-export>");
         std::process::exit(64);
     };
 
@@ -368,11 +364,8 @@ fn browse_conversations(
     conversations: &[Conversation],
     summaries: &[ConversationSummary],
 ) -> Result<()> {
+    println!("{}", dim("type to filter titles, press Enter to list all, q to exit."));
     loop {
-        println!(
-            "{}",
-            dim("type to filter titles, press Enter to list all, q to exit.")
-        );
         print!("{} ", accent_prompt("search>"));
         io::stdout().flush()?;
         let input = read_line()?;
