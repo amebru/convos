@@ -3,11 +3,150 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use nu_ansi_term::{Color, Style as AnsiStyle};
+use once_cell::sync::Lazy;
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
 use serde::Deserialize;
 use serde_json::Value;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
+
+const USER_SHADE: Color = Color::Rgb(200, 200, 200);
+const ACCENT_COLOR: Color = Color::Rgb(188, 205, 238);
+const EDGE_COLOR: Color = Color::Rgb(217, 182, 203);
+const DIM_COLOR: Color = Color::Rgb(125, 132, 140);
+const DOT_ACTIVE_COLOR: Color = Color::Rgb(188, 205, 238);
+const DOT_INACTIVE_COLOR: Color = Color::Rgb(90, 94, 104);
+const PROGRESS_FRAMES: [&str; 6] = ["●○○○○○", "●●○○○○", "●●●○○○", "●●●●○○", "●●●●●○", "●●●●●●"];
+
+fn accent_style() -> AnsiStyle {
+    AnsiStyle::new().fg(ACCENT_COLOR)
+}
+
+fn dim_style() -> AnsiStyle {
+    AnsiStyle::new().fg(DIM_COLOR)
+}
+
+fn edge_style() -> AnsiStyle {
+    AnsiStyle::new().fg(EDGE_COLOR)
+}
+
+fn user_style() -> AnsiStyle {
+    AnsiStyle::new().fg(USER_SHADE)
+}
+
+fn accent(text: &str) -> String {
+    accent_style().paint(text).to_string()
+}
+
+fn dim(text: &str) -> String {
+    dim_style().paint(text).to_string()
+}
+
+fn edge(text: &str) -> String {
+    edge_style().paint(text).to_string()
+}
+
+fn user_prefix() -> String {
+    user_style().paint(">>> ").to_string()
+}
+
+fn colorize_user_text(text: &str) -> String {
+    user_style().paint(text).to_string()
+}
+
+fn accent_prompt(label: &str) -> String {
+    AnsiStyle::new()
+        .fg(ACCENT_COLOR)
+        .bold()
+        .paint(label)
+        .to_string()
+}
+
+fn accent_bullet() -> String {
+    edge_style().paint("⋆").to_string()
+}
+
+fn pastel_rule() -> String {
+    edge_style()
+        .paint("────────────────────────────────")
+        .to_string()
+}
+
+fn style_frame(frame: &str) -> String {
+    frame
+        .chars()
+        .map(|ch| match ch {
+            '●' => AnsiStyle::new()
+                .fg(DOT_ACTIVE_COLOR)
+                .bold()
+                .paint("●")
+                .to_string(),
+            '○' => AnsiStyle::new()
+                .fg(DOT_INACTIVE_COLOR)
+                .paint("○")
+                .to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn print_banner(export_path: &Path) {
+    println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
+    println!(
+        "{} {}",
+        accent_bullet(),
+        accent("chatgpt-reader is warming up")
+    );
+    println!(
+        "{} {}",
+        accent_bullet(),
+        dim(&format!("source {}", export_path.display()))
+    );
+    println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
+}
+
+fn with_progress<F, T>(label: &str, action: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let running = Arc::new(AtomicBool::new(true));
+    let spinner_running = Arc::clone(&running);
+    let display_label = format!("{} {}", accent_bullet(), accent(&format!("{}...", label)));
+    let spinner_label = display_label.clone();
+
+    let handle = thread::spawn(move || {
+        let mut index = 0usize;
+        while spinner_running.load(Ordering::Relaxed) {
+            let frame = PROGRESS_FRAMES[index % PROGRESS_FRAMES.len()];
+            let styled = style_frame(frame);
+            print!("\r{} {}", spinner_label, styled);
+            let _ = io::stdout().flush();
+            index += 1;
+            thread::sleep(Duration::from_millis(110));
+        }
+    });
+
+    let result = action();
+
+    running.store(false, Ordering::Relaxed);
+    let _ = handle.join();
+    let final_frame = style_frame(PROGRESS_FRAMES.last().copied().unwrap_or("●●●●●●"));
+    print!("\r{} {}\n", display_label, final_frame);
+    io::stdout().flush()?;
+
+    result
+}
 
 fn main() -> Result<()> {
     let mut args = env::args_os();
@@ -48,27 +187,19 @@ fn main() -> Result<()> {
 }
 
 fn run(export_path: &Path) -> Result<()> {
-    println!(
-        "Opening export at `{}`...",
-        export_path
-            .canonicalize()
-            .unwrap_or_else(|_| export_path.to_path_buf())
-            .display()
-    );
+    print_banner(export_path);
 
-    print!("  Loading conversations.json ... ");
-    io::stdout().flush()?;
-    let conversations = load_conversations(export_path)?;
-    println!("done ({} conversation(s)).", conversations.len());
+    let conversations = with_progress("loading conversations", || load_conversations(export_path))?;
+    let count_note = dim(&format!("{} threads detected", conversations.len()));
+    println!("{} {}", accent_bullet(), count_note);
 
-    print!("  Indexing conversations ... ");
-    io::stdout().flush()?;
-    let summaries = build_summaries(&conversations);
-    println!("done.");
+    let summaries = with_progress("organising threads", || Ok(build_summaries(&conversations)))?;
 
     browse_conversations(&conversations, &summaries)?;
 
-    println!("Goodbye!");
+    println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
+    println!("{}", dim("see you next time!"));
+    println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
     Ok(())
 }
 
@@ -99,10 +230,10 @@ fn build_summaries(conversations: &[ConversationRecord]) -> Vec<ConversationSumm
         .collect();
 
     summaries.sort_by(|a, b| {
-        let a_time = a.create_time.unwrap_or(f64::MIN);
-        let b_time = b.create_time.unwrap_or(f64::MIN);
-        b_time
-            .partial_cmp(&a_time)
+        let a_time = a.create_time.unwrap_or(f64::MAX);
+        let b_time = b.create_time.unwrap_or(f64::MAX);
+        a_time
+            .partial_cmp(&b_time)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
@@ -113,10 +244,12 @@ fn browse_conversations(
     conversations: &[ConversationRecord],
     summaries: &[ConversationSummary],
 ) -> Result<()> {
-    println!("Commands: press Enter to list all, type text to filter titles, `q` to quit.");
-
     loop {
-        print!("\nsearch> ");
+        println!(
+            "{}",
+            dim("type to filter titles, press Enter to list all, q to exit.")
+        );
+        print!("\n{} ", accent_prompt("search>"));
         io::stdout().flush()?;
         let input = read_line()?;
         let trimmed = input.trim();
@@ -128,9 +261,12 @@ fn browse_conversations(
         let matches = filter_conversations(summaries, trimmed);
         if matches.is_empty() {
             if trimmed.is_empty() {
-                println!("No conversations available.");
+                println!("{}", dim("no conversations available."));
             } else {
-                println!("No conversations matched `{trimmed}`.");
+                println!(
+                    "{}",
+                    dim(&format!("no conversations matched `{}`.", trimmed))
+                );
             }
             continue;
         }
@@ -138,7 +274,7 @@ fn browse_conversations(
         let total = show_matches(&matches);
 
         if total == 0 {
-            println!("Nothing to select; refine the search.");
+            println!("{}", dim("nothing to select; refine the search."));
             continue;
         }
 
@@ -149,34 +285,39 @@ fn browse_conversations(
         let summary = &matches[choice].summary;
         let conversation = &conversations[summary.index];
 
-        println!("\n=== {} ===", summary.title);
+        println!("\n{}", pastel_rule());
+        println!("{} {}", accent_bullet(), accent(&summary.title));
         if let Some(created) = summary.create_time.and_then(format_timestamp) {
-            println!("Started: {created}");
+            println!("{} {}", accent_bullet(), dim(&format!("started {created}")));
         }
-        println!("Conversation ID: {}", summary.id);
-        println!("----------------------------------------");
+        println!("{} {}", accent_bullet(), dim(&format!("id {}", summary.id)));
+        println!("{}", pastel_rule());
 
         let messages = extract_conversation_messages(conversation);
         if messages.is_empty() {
-            println!("[No printable messages in this conversation]");
+            println!("{}", dim("[no printable messages in this conversation]"));
         } else {
             for message in messages {
-                println!(
-                    // "\n{role} {time}\n{content}",
-                    "\n{role}{content}",
-                    role = format_role(&message.role),
-                    // time = message
-                    //     .time
-                    //     .and_then(format_timestamp)
-                    //     .map(|t| format!("({t})"))
-                    //     .unwrap_or_default(),
-                    content = message.content
-                );
+                let rendered_content = render_markdown(&message.content);
+                match message.role.as_str() {
+                    "user" => {
+                        let content = colorize_user_text(&rendered_content);
+                        println!("\n{}{}", user_prefix(), content);
+                    }
+                    "assistant" => {
+                        println!("\n{}", rendered_content);
+                    }
+                    other => {
+                        let tag = accent(&format!("[{}] ", other.to_uppercase()));
+                        let content = dim(&rendered_content);
+                        println!("\n{}{}", tag, content);
+                    }
+                }
             }
         }
 
-        println!("\n----------------------------------------");
-        println!("Press Enter to return to the search prompt.");
+        println!("\n{}", pastel_rule());
+        println!("{}", dim("press Enter to return to the search prompt"));
         if read_line().is_err() {
             return Ok(());
         }
@@ -204,18 +345,24 @@ fn filter_conversations<'a>(
 }
 
 fn show_matches(matches: &[MatchedConversation<'_>]) -> usize {
-    println!("Found {} conversation(s).", matches.len());
+    println!(
+        "{} {}",
+        accent_bullet(),
+        accent(&format!("found {} conversation(s).", matches.len()))
+    );
 
-    for (ordinal, matched) in matches.iter().enumerate().rev() {
+    for (ordinal, matched) in matches.iter().enumerate() {
         let summary = matched.summary;
         let timestamp = summary
             .create_time
             .and_then(format_timestamp)
             .unwrap_or_else(|| "unknown time".to_string());
         println!(
-            "[{index:>2}] {title} — {timestamp}",
-            index = ordinal + 1,
-            title = summary.title
+            "{} [{}] {} {}",
+            edge("|"),
+            accent(&format!("{:>2}", ordinal + 1)),
+            summary.title,
+            dim(&format!("· {}", timestamp))
         );
     }
 
@@ -226,9 +373,12 @@ fn prompt_match_choice(count: usize) -> Result<Option<usize>> {
     if count == 0 {
         return Ok(None);
     }
-    println!("Select a conversation number from the list or press Enter to search again.");
+    println!(
+        "{}",
+        dim("select a conversation number or press Enter to search again.")
+    );
     loop {
-        print!("choice> ");
+        print!("{} ", accent_prompt("choice>"));
         io::stdout().flush()?;
         let input = read_line()?;
         let trimmed = input.trim();
@@ -240,7 +390,13 @@ fn prompt_match_choice(count: usize) -> Result<Option<usize>> {
                 return Ok(Some(num - 1));
             }
         }
-        println!("Please enter a number between 1 and {count}, or press Enter to cancel.");
+        println!(
+            "{}",
+            dim(&format!(
+                "please enter a number between 1 and {}, or press Enter to cancel.",
+                count
+            ))
+        );
     }
 }
 
@@ -294,7 +450,6 @@ fn extract_conversation_messages(convo: &ConversationRecord) -> Vec<MessageView>
                     messages.push(MessageView {
                         role,
                         content: text,
-                        time: message.create_time,
                     });
                 }
             }
@@ -359,18 +514,6 @@ fn extract_text(value: &Option<Value>) -> Option<String> {
             }
         }
         _ => None,
-    }
-}
-
-fn format_role(role: &str) -> String {
-    match role {
-        // "user" => "USER".to_string(),
-        "user" => "\n>>> ".to_string(),
-        // "assistant" => "ASSISTANT".to_string(),
-        "assistant" => "".to_string(),
-        // "system" => "SYSTEM".to_string(),
-        // "tool" => "TOOL".to_string(),
-        other => format!("<{}>", other),
     }
 }
 
@@ -448,5 +591,264 @@ struct MatchedConversation<'a> {
 struct MessageView {
     role: String,
     content: String,
-    time: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineStyle {
+    Bold,
+    Italic,
+    Heading,
+    BlockQuote,
+}
+
+#[derive(Clone, Debug)]
+enum ListState {
+    Unordered,
+    Ordered(u64),
+}
+
+static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(|| SyntaxSet::load_defaults_newlines());
+static THEME: Lazy<Theme> = Lazy::new(|| {
+    let theme_set = ThemeSet::load_defaults();
+    theme_set
+        .themes
+        .get("base16-ocean.dark")
+        .cloned()
+        .unwrap_or_else(|| theme_set.themes.values().next().cloned().unwrap())
+});
+
+fn render_markdown(text: &str) -> String {
+    let mut output = String::new();
+    let mut inline_styles: Vec<InlineStyle> = Vec::new();
+    let mut list_stack: Vec<ListState> = Vec::new();
+    let mut code_block: Option<(Option<String>, String)> = None;
+
+    let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES;
+    let parser = Parser::new_ext(text, options);
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let language = match kind {
+                    CodeBlockKind::Fenced(lang) => {
+                        let trimmed = lang.into_string();
+                        let trimmed = trimmed.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    }
+                    CodeBlockKind::Indented => None,
+                };
+                code_block = Some((language, String::new()));
+            }
+            Event::End(Tag::CodeBlock(_)) => {
+                if let Some((language, buffer)) = code_block.take() {
+                    if !output.ends_with('\n') && !output.is_empty() {
+                        output.push('\n');
+                    }
+                    let highlighted = highlight_code_block(&buffer, language.as_deref());
+                    output.push_str(&highlighted);
+                    if !highlighted.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+            }
+            Event::Text(segment) => {
+                if let Some((_, ref mut buffer)) = code_block {
+                    buffer.push_str(&segment);
+                } else {
+                    output.push_str(&apply_inline_styles(&inline_styles, &segment));
+                }
+            }
+            Event::Code(code) => {
+                output.push_str(&highlight_inline_code(&code));
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, ref mut buffer)) = code_block {
+                    buffer.push('\n');
+                } else {
+                    output.push('\n');
+                }
+            }
+            Event::Start(Tag::Strong) => inline_styles.push(InlineStyle::Bold),
+            Event::End(Tag::Strong) => pop_style(&mut inline_styles, InlineStyle::Bold),
+            Event::Start(Tag::Emphasis) => inline_styles.push(InlineStyle::Italic),
+            Event::End(Tag::Emphasis) => pop_style(&mut inline_styles, InlineStyle::Italic),
+            Event::Start(Tag::Heading(_, _, _)) => {
+                if !output.ends_with('\n') && !output.is_empty() {
+                    output.push('\n');
+                }
+                inline_styles.push(InlineStyle::Heading);
+            }
+            Event::End(Tag::Heading(_, _, _)) => {
+                pop_style(&mut inline_styles, InlineStyle::Heading);
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            Event::Start(Tag::Paragraph) => {
+                if !output.ends_with('\n') && !output.is_empty() {
+                    output.push('\n');
+                }
+            }
+            Event::End(Tag::Paragraph) => {
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            Event::Start(Tag::BlockQuote) => {
+                inline_styles.push(InlineStyle::BlockQuote);
+                if !output.ends_with('\n') && !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str("> ");
+            }
+            Event::End(Tag::BlockQuote) => {
+                pop_style(&mut inline_styles, InlineStyle::BlockQuote);
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            Event::Start(Tag::List(start)) => match start {
+                Some(number) => {
+                    let start_at = if number == 0 { 1 } else { number };
+                    list_stack.push(ListState::Ordered(start_at as u64));
+                }
+                None => list_stack.push(ListState::Unordered),
+            },
+            Event::End(Tag::List(_)) => {
+                list_stack.pop();
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            Event::Start(Tag::Item) => {
+                if !output.ends_with('\n') && !output.is_empty() {
+                    output.push('\n');
+                }
+                match list_stack.last_mut() {
+                    Some(ListState::Ordered(number)) => {
+                        output.push_str(&format!("{number}. "));
+                        *number += 1;
+                    }
+                    Some(ListState::Unordered) => output.push_str("- "),
+                    None => {}
+                }
+            }
+            Event::End(Tag::Item) => {
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            Event::Html(html) => output.push_str(&html),
+            Event::FootnoteReference(reference) => {
+                output.push_str(&format!("[^{}]", reference));
+            }
+            Event::TaskListMarker(checked) => {
+                let marker = if checked { "[x] " } else { "[ ] " };
+                output.push_str(marker);
+            }
+            Event::Rule => {
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str("----\n");
+            }
+            Event::Start(_) | Event::End(_) => {}
+        }
+    }
+
+    if let Some((language, buffer)) = code_block.take() {
+        if !output.ends_with('\n') && !output.is_empty() {
+            output.push('\n');
+        }
+        let highlighted = highlight_code_block(&buffer, language.as_deref());
+        output.push_str(&highlighted);
+        if !highlighted.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+
+    output.trim_end().to_string()
+}
+
+fn pop_style(stack: &mut Vec<InlineStyle>, style: InlineStyle) {
+    if let Some(index) = stack.iter().rposition(|entry| *entry == style) {
+        stack.remove(index);
+    }
+}
+
+fn apply_inline_styles(stack: &[InlineStyle], text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut style = AnsiStyle::new();
+    let mut styled = false;
+    let mut color: Option<Color> = None;
+
+    for entry in stack {
+        match entry {
+            InlineStyle::Bold => {
+                style = style.bold();
+                styled = true;
+            }
+            InlineStyle::Italic => {
+                style = style.italic();
+                styled = true;
+            }
+            InlineStyle::Heading => {
+                style = style.bold();
+                color = color.or(Some(Color::LightBlue));
+                styled = true;
+            }
+            InlineStyle::BlockQuote => {
+                color = color.or(Some(Color::Cyan));
+                styled = true;
+            }
+        }
+    }
+
+    if let Some(color) = color {
+        style = style.fg(color);
+        styled = true;
+    }
+
+    if styled {
+        style.paint(text).to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn highlight_inline_code(code: &str) -> String {
+    let style = AnsiStyle::new()
+        .fg(Color::Rgb(255, 224, 138))
+        .on(Color::Rgb(60, 63, 65));
+    style.paint(code).to_string()
+}
+
+fn highlight_code_block(code: &str, language: Option<&str>) -> String {
+    let syntax_set: &SyntaxSet = &SYNTAX_SET;
+    let theme: &Theme = &THEME;
+
+    let syntax: &SyntaxReference =
+        match language.and_then(|lang| syntax_set.find_syntax_by_token(lang)) {
+            Some(syntax) => syntax,
+            None => syntax_set.find_syntax_plain_text(),
+        };
+
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut highlighted = String::new();
+
+    for line in LinesWithEndings::from(code) {
+        match highlighter.highlight_line(line, syntax_set) {
+            Ok(ranges) => highlighted.push_str(&as_24_bit_terminal_escaped(&ranges, false)),
+            Err(_) => highlighted.push_str(line),
+        }
+    }
+
+    highlighted
 }
