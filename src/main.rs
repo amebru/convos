@@ -82,7 +82,7 @@ fn load_conversations(path: &Path) -> Result<Vec<ConversationRecord>> {
 }
 
 fn build_summaries(conversations: &[ConversationRecord]) -> Vec<ConversationSummary> {
-    conversations
+    let mut summaries: Vec<_> = conversations
         .iter()
         .enumerate()
         .map(|(idx, convo)| ConversationSummary {
@@ -96,7 +96,17 @@ fn build_summaries(conversations: &[ConversationRecord]) -> Vec<ConversationSumm
                 .to_string(),
             create_time: convo.create_time,
         })
-        .collect()
+        .collect();
+
+    summaries.sort_by(|a, b| {
+        let a_time = a.create_time.unwrap_or(f64::MIN);
+        let b_time = b.create_time.unwrap_or(f64::MIN);
+        b_time
+            .partial_cmp(&a_time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    summaries
 }
 
 fn browse_conversations(
@@ -125,20 +135,19 @@ fn browse_conversations(
             continue;
         }
 
-        let displayed = show_matches(&matches);
+        let total = show_matches(&matches);
 
-        if displayed.is_empty() {
+        if total == 0 {
             println!("Nothing to select; refine the search.");
             continue;
         }
 
-        let Some(choice) = prompt_match_choice(displayed.len())? else {
+        let Some(choice) = prompt_match_choice(total)? else {
             continue;
         };
 
-        let summary = &matches[displayed[choice]].summary;
-        let original_index = summary.index;
-        let conversation = &conversations[original_index];
+        let summary = &matches[choice].summary;
+        let conversation = &conversations[summary.index];
 
         println!("\n=== {} ===", summary.title);
         if let Some(created) = summary.create_time.and_then(format_timestamp) {
@@ -153,13 +162,14 @@ fn browse_conversations(
         } else {
             for message in messages {
                 println!(
-                    "\n{role} {time}\n{content}",
+                    // "\n{role} {time}\n{content}",
+                    "\n{role}{content}",
                     role = format_role(&message.role),
-                    time = message
-                        .time
-                        .and_then(format_timestamp)
-                        .map(|t| format!("({t})"))
-                        .unwrap_or_default(),
+                    // time = message
+                    //     .time
+                    //     .and_then(format_timestamp)
+                    //     .map(|t| format!("({t})"))
+                    //     .unwrap_or_default(),
                     content = message.content
                 );
             }
@@ -180,16 +190,12 @@ fn filter_conversations<'a>(
     let query_lower = query.to_lowercase();
     summaries
         .iter()
-        .enumerate()
-        .filter_map(|(display_index, summary)| {
+        .filter_map(|summary| {
             if query.is_empty()
                 || summary.title.to_lowercase().contains(&query_lower)
-                || summary.id.contains(&query_lower)
+                || summary.id.to_lowercase().contains(&query_lower)
             {
-                Some(MatchedConversation {
-                    display_index,
-                    summary,
-                })
+                Some(MatchedConversation { summary })
             } else {
                 None
             }
@@ -197,15 +203,10 @@ fn filter_conversations<'a>(
         .collect()
 }
 
-fn show_matches(matches: &[MatchedConversation<'_>]) -> Vec<usize> {
-    const MAX_DISPLAY: usize = 20;
-    println!(
-        "Found {} conversation(s). Showing up to {MAX_DISPLAY}.",
-        matches.len()
-    );
+fn show_matches(matches: &[MatchedConversation<'_>]) -> usize {
+    println!("Found {} conversation(s).", matches.len());
 
-    let mut displayed_indices = Vec::new();
-    for (ordinal, matched) in matches.iter().take(MAX_DISPLAY).enumerate() {
+    for (ordinal, matched) in matches.iter().enumerate().rev() {
         let summary = matched.summary;
         let timestamp = summary
             .create_time
@@ -216,17 +217,9 @@ fn show_matches(matches: &[MatchedConversation<'_>]) -> Vec<usize> {
             index = ordinal + 1,
             title = summary.title
         );
-        displayed_indices.push(matched.display_index);
     }
 
-    if matches.len() > MAX_DISPLAY {
-        println!(
-            "... plus {} more. Use a narrower search to see the rest.",
-            matches.len() - MAX_DISPLAY
-        );
-    }
-
-    displayed_indices
+    matches.len()
 }
 
 fn prompt_match_choice(count: usize) -> Result<Option<usize>> {
@@ -371,11 +364,13 @@ fn extract_text(value: &Option<Value>) -> Option<String> {
 
 fn format_role(role: &str) -> String {
     match role {
-        "user" => "USER".to_string(),
-        "assistant" => "ASSISTANT".to_string(),
-        "system" => "SYSTEM".to_string(),
-        "tool" => "TOOL".to_string(),
-        other => other.to_uppercase(),
+        // "user" => "USER".to_string(),
+        "user" => "\n>>> ".to_string(),
+        // "assistant" => "ASSISTANT".to_string(),
+        "assistant" => "".to_string(),
+        // "system" => "SYSTEM".to_string(),
+        // "tool" => "TOOL".to_string(),
+        other => format!("<{}>", other),
     }
 }
 
@@ -446,7 +441,6 @@ struct ConversationSummary {
 
 #[derive(Debug)]
 struct MatchedConversation<'a> {
-    display_index: usize,
     summary: &'a ConversationSummary,
 }
 
