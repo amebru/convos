@@ -5,6 +5,11 @@ It auto-detects ChatGPT and Claude archive formats and renders conversations wit
 syntax-highlighted code blocks and lightweight UI chrome.
 
 ## Build & Install
+- Clone the repo
+  ```
+  git clone https://github.com/amebru/convos.git
+  cd convos
+  ```
 - Compile an optimized binary:
   ```
   cargo build --release
@@ -23,5 +28,4 @@ convos /path/to/chatgpt-chatlogs/<chatgpt-export-directory-hash>...
 ```
 convos /path/to/claude-chatlogs/data-...
 ```
-The app shows a spinner while loading, lists conversations in reverse chronological
-order, and lets you filter by typing. Press `q` at the search prompt to exit.
+And away you go.
