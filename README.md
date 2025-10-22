@@ -4,6 +4,8 @@
 It auto-detects ChatGPT and Claude archive formats and renders conversations with
 syntax-highlighted code blocks and lightweight UI chrome.
 
+https://github.com/user-attachments/assets/6fcf45bc-0fa1-4c1b-87e0-c3e28d1b6085
+
 ## Build & Install
 - Clone the repo
   ```
