@@ -31,3 +31,9 @@ convos /path/to/chatgpt-chatlogs/<chatgpt-export-directory-hash>...
 convos /path/to/claude-chatlogs/data-...
 ```
 And away you go.
+
+## TODO
+
+- [ ] add non-interactive mode
+
+
