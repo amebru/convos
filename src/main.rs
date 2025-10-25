@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -27,6 +27,12 @@ const DIM_COLOR: Color = Color::Rgb(125, 132, 140);
 const DOT_ACTIVE_COLOR: Color = Color::Rgb(188, 205, 238);
 const DOT_INACTIVE_COLOR: Color = Color::Rgb(90, 94, 104);
 const PROGRESS_FRAMES: [&str; 6] = ["●○○○○○", "●●○○○○", "●●●○○○", "●●●●○○", "●●●●●○", "●●●●●●"];
+
+enum Mode {
+    Interactive,
+    ListOnly,
+    ShowIndex(usize),
+}
 
 fn accent_style() -> AnsiStyle {
     AnsiStyle::new().fg(ACCENT_COLOR)
@@ -104,6 +110,9 @@ fn style_frame(frame: &str) -> String {
 fn print_banner(export_path: &Path) {
     println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
     println!("{} {}", accent_bullet(), accent("convos is warming up"));
+    println!("{}", accent("      /\\_/\\"));
+    println!("{} {}", accent_bullet(), accent(" ( o.o )  miaou!"));
+    println!("{}", accent("      > ^ <"));
     println!(
         "{} {}",
         accent_bullet(),
@@ -149,16 +158,38 @@ fn main() -> Result<()> {
     let _ = args.next();
 
     let Some(export_arg) = args.next() else {
-        eprintln!("Usage: convos <path-to-export>");
+        eprintln!("Usage: convos <path-to-export> [--list|NUMBER]");
         std::process::exit(64);
     };
 
+    let export_path = PathBuf::from(&export_arg);
+
+    let mode = match args.next() {
+        None => Mode::Interactive,
+        Some(flag) => {
+            let flag_string = flag.to_string_lossy().to_string();
+            if flag_string == "--list" {
+                Mode::ListOnly
+            } else {
+                let number: usize = flag_string.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid conversation number `{}`.", flag_string);
+                    std::process::exit(64);
+                });
+                if number == 0 {
+                    eprintln!("Conversation number must be greater than zero.");
+                    std::process::exit(64);
+                }
+                Mode::ShowIndex(number - 1)
+            }
+        }
+    };
+
     if args.next().is_some() {
-        eprintln!("Only one export path is expected.");
+        eprintln!("Too many arguments provided.");
+        eprintln!("Usage: convos <path-to-export> [--list|NUMBER]");
         std::process::exit(64);
     }
 
-    let export_path = PathBuf::from(export_arg);
     if !export_path.exists() {
         eprintln!(
             "The provided path `{}` does not exist.",
@@ -175,49 +206,163 @@ fn main() -> Result<()> {
         std::process::exit(66);
     }
 
-    if let Err(err) = run(&export_path) {
+    if let Err(err) = run(&export_path, mode) {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
     Ok(())
 }
 
-fn run(export_path: &Path) -> Result<()> {
-    print_banner(export_path);
+fn run(export_path: &Path, mode: Mode) -> Result<()> {
+    if matches!(mode, Mode::Interactive) {
+        print_banner(export_path);
+    }
 
-    let conversations = with_progress("loading conversations", || load_conversations(export_path))?;
-    let count_note = dim(&format!("{} threads detected", conversations.len()));
-    println!("{} {}", accent_bullet(), count_note);
+    let show_progress = matches!(mode, Mode::Interactive);
 
-    let summaries = with_progress("organising threads", || Ok(build_summaries(&conversations)))?;
+    let conversations = if show_progress {
+        with_progress("loading conversations", || load_conversations(export_path))?
+    } else {
+        load_conversations(export_path)?
+    };
 
-    browse_conversations(&conversations, &summaries)?;
+    let summaries = if show_progress {
+        with_progress("organising threads", || Ok(build_summaries(&conversations)))?
+    } else {
+        build_summaries(&conversations)
+    };
 
-    println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
-    println!("{}", dim("see you next time!"));
-    println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
+    let total = conversations.len();
+    let count_note = dim(&format!("{} threads detected", total));
+
+    match mode {
+        Mode::Interactive => {
+            println!("{} {}", accent_bullet(), count_note);
+            browse_conversations(&conversations, &summaries)?;
+            println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
+            println!("{}", dim("see you next time!"));
+            println!("{}", edge("~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"));
+        }
+        Mode::ListOnly => {
+            println!("{} {}", accent_bullet(), count_note);
+            print_conversation_list(&summaries);
+        }
+        Mode::ShowIndex(index) => {
+            if summaries.is_empty() {
+                return Err(anyhow!("no conversations available"));
+            }
+            let summary = summaries.get(index).ok_or_else(|| {
+                anyhow!(
+                    "conversation number {} out of range (1..={})",
+                    index + 1,
+                    summaries.len()
+                )
+            })?;
+            let conversation = &conversations[summary.index];
+            print_conversation(conversation, summary, false);
+        }
+    }
+
     Ok(())
 }
 
-fn load_conversations(path: &Path) -> Result<Vec<Conversation>> {
-    let file_path = path.join("conversations.json");
-    if !file_path.exists() {
+fn find_conversation_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if root.is_file() {
+        let file_name = root.file_name().and_then(|name| name.to_str());
+        if file_name == Some("conversations.json") {
+            return Ok(vec![root.to_path_buf()]);
+        }
         return Err(anyhow!(
-            "expected conversations.json in `{}`",
-            path.display()
+            "expected conversations.json but found `{}`",
+            root.display()
         ));
     }
 
-    let raw = fs::read_to_string(&file_path).with_context(|| format!("reading {file_path:?}"))?;
-    let json: Value = serde_json::from_str(&raw).with_context(|| "parsing conversations.json")?;
-    let items = json
-        .as_array()
-        .ok_or_else(|| anyhow!("expected top-level array in conversations.json"))?;
+    let direct = root.join("conversations.json");
+    if direct.is_file() {
+        return Ok(vec![direct]);
+    }
 
-    let kind = detect_export_kind(items)?;
-    match kind {
-        ExportKind::ChatGpt => parse_chatgpt_conversations(&raw),
-        ExportKind::Claude => parse_claude_conversations(&raw),
+    let mut results = Vec::new();
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    let mut visited = HashSet::new();
+    const MAX_SCAN_DEPTH: usize = 3;
+
+    queue.push_back((root.to_path_buf(), 0));
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+
+        if depth > MAX_SCAN_DEPTH {
+            continue;
+        }
+
+        if current != root {
+            let candidate = current.join("conversations.json");
+            if candidate.is_file() {
+                results.push(candidate);
+                continue;
+            }
+        }
+
+        if depth == MAX_SCAN_DEPTH {
+            continue;
+        }
+
+        let entries = fs::read_dir(&current)
+            .with_context(|| format!("reading directory `{}`", current.display()))?;
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("reading entry inside `{}`", current.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+
+    if results.is_empty() {
+        Err(anyhow!(
+            "could not find conversations.json inside `{}`",
+            root.display()
+        ))
+    } else {
+        results.sort();
+        results.dedup();
+        Ok(results)
+    }
+}
+
+fn load_conversations(path: &Path) -> Result<Vec<Conversation>> {
+    let files = find_conversation_files(path)?;
+    let mut conversations = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for file_path in files {
+        let raw = fs::read_to_string(&file_path)
+            .with_context(|| format!("reading `{}`", file_path.display()))?;
+        let json: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing `{}`", file_path.display()))?;
+        let items = json
+            .as_array()
+            .ok_or_else(|| anyhow!("expected top-level array in `{}`", file_path.display()))?;
+
+        let kind = detect_export_kind(items)?;
+        let mut parsed = match kind {
+            ExportKind::ChatGpt => parse_chatgpt_conversations(&raw)?,
+            ExportKind::Claude => parse_claude_conversations(&raw)?,
+        };
+
+        parsed.retain(|conversation| seen_ids.insert(conversation.id.clone()));
+        conversations.extend(parsed);
+    }
+
+    if conversations.is_empty() {
+        Err(anyhow!("no conversations found in `{}`", path.display()))
+    } else {
+        Ok(conversations)
     }
 }
 
@@ -360,11 +505,78 @@ fn build_summaries(conversations: &[Conversation]) -> Vec<ConversationSummary> {
     summaries
 }
 
+fn print_conversation_list(summaries: &[ConversationSummary]) {
+    println!(
+        "{} {}",
+        accent_bullet(),
+        accent(&format!("found {} conversation(s).", summaries.len()))
+    );
+
+    for (ordinal, summary) in summaries.iter().enumerate() {
+        let timestamp = summary
+            .created_at
+            .map(format_timestamp)
+            .unwrap_or_else(|| "unknown time".to_string());
+        println!(
+            "{} [{}] {} {}",
+            edge("|"),
+            accent(&format!("{:>2}", ordinal + 1)),
+            summary.title,
+            dim(&format!("· {}", timestamp))
+        );
+    }
+}
+
+fn print_conversation(
+    conversation: &Conversation,
+    summary: &ConversationSummary,
+    leading_newline: bool,
+) {
+    if leading_newline {
+        println!();
+    }
+    println!("{}", pastel_rule());
+    println!("{} {}", accent_bullet(), accent(&summary.title));
+    if let Some(created) = summary.created_at.map(format_timestamp) {
+        println!("{} {}", accent_bullet(), dim(&format!("started {created}")));
+    }
+    println!("{} {}", accent_bullet(), dim(&format!("id {}", summary.id)));
+    println!("{}", pastel_rule());
+
+    if conversation.messages.is_empty() {
+        println!("{}", dim("[no printable messages in this conversation]"));
+    } else {
+        for message in &conversation.messages {
+            let rendered = render_markdown(&message.content);
+            match message.role.as_str() {
+                "user" => {
+                    let content = colorize_user_text(&rendered);
+                    println!("\n{}{}", user_prefix(), content);
+                }
+                "assistant" => {
+                    println!("\n{}", rendered);
+                }
+                other => {
+                    let tag = accent(&format!("[{}] ", other.to_uppercase()));
+                    let content = dim(&rendered);
+                    println!("\n{}{}", tag, content);
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("{}", pastel_rule());
+}
+
 fn browse_conversations(
     conversations: &[Conversation],
     summaries: &[ConversationSummary],
 ) -> Result<()> {
-    println!("{}", dim("type to filter titles, press Enter to list all, q to exit."));
+    println!(
+        "{}",
+        dim("type to filter titles, press Enter to list all, q to exit.")
+    );
     loop {
         print!("{} ", accent_prompt("search>"));
         io::stdout().flush()?;
@@ -401,38 +613,7 @@ fn browse_conversations(
 
         let summary = &matches[choice].summary;
         let conversation = &conversations[summary.index];
-
-        println!("\n{}", pastel_rule());
-        println!("{} {}", accent_bullet(), accent(&summary.title));
-        if let Some(created) = summary.created_at.map(format_timestamp) {
-            println!("{} {}", accent_bullet(), dim(&format!("started {created}")));
-        }
-        println!("{} {}", accent_bullet(), dim(&format!("id {}", summary.id)));
-        println!("{}", pastel_rule());
-
-        if conversation.messages.is_empty() {
-            println!("{}", dim("[no printable messages in this conversation]"));
-        } else {
-            for message in &conversation.messages {
-                let rendered = render_markdown(&message.content);
-                match message.role.as_str() {
-                    "user" => {
-                        let content = colorize_user_text(&rendered);
-                        println!("\n{}{}", user_prefix(), content);
-                    }
-                    "assistant" => {
-                        println!("\n{}", rendered);
-                    }
-                    other => {
-                        let tag = accent(&format!("[{}] ", other.to_uppercase()));
-                        let content = dim(&rendered);
-                        println!("\n{}{}", tag, content);
-                    }
-                }
-            }
-        }
-
-        println!("\n{}", pastel_rule());
+        print_conversation(conversation, summary, true);
         println!("{}", dim("press Enter to return to the search prompt"));
         if read_line().is_err() {
             return Ok(());
