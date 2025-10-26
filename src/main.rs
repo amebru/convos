@@ -38,8 +38,8 @@ struct Args {
     /// Path to the exported conversation directory
     export_path: PathBuf,
 
-    /// Conversation number to display (1-based index)
-    conversation_number: Option<usize>,
+    /// Conversation number (1-based index) or hash to display
+    conversation_id: Option<String>,
 
     /// List all conversations
     #[arg(short, long, conflicts_with_all = ["artifacts"])]
@@ -60,9 +60,9 @@ enum Mode {
     Interactive,
     ListOnly,
     ListAllArtifacts,
-    ShowIndex { index: usize, show_artifacts: bool },
+    ShowConversation { id: String, show_artifacts: bool },
     DownloadArtifact {
-        conversation_index: usize,
+        conversation_id: String,
         artifact_number: usize,
         output_dir: Option<PathBuf>,
     },
@@ -210,16 +210,12 @@ fn main() -> Result<()> {
     // Determine mode based on arguments
     let mode = if args.list {
         Mode::ListOnly
-    } else if args.conversation_number.is_none() && args.artifacts {
+    } else if args.conversation_id.is_none() && args.artifacts {
         Mode::ListAllArtifacts
-    } else if args.conversation_number.is_none() {
+    } else if args.conversation_id.is_none() {
         Mode::Interactive
     } else {
-        let conversation_number = args.conversation_number.unwrap();
-        if conversation_number == 0 {
-            eprintln!("Conversation number must be greater than zero.");
-            std::process::exit(64);
-        }
+        let conversation_id = args.conversation_id.unwrap();
 
         if args.artifacts && args.artifact_number.is_some() {
             let artifact_number = args.artifact_number.unwrap();
@@ -228,13 +224,13 @@ fn main() -> Result<()> {
                 std::process::exit(64);
             }
             Mode::DownloadArtifact {
-                conversation_index: conversation_number - 1,
+                conversation_id,
                 artifact_number,
                 output_dir: args.output_dir,
             }
         } else if args.artifacts {
-            Mode::ShowIndex {
-                index: conversation_number - 1,
+            Mode::ShowConversation {
+                id: conversation_id,
                 show_artifacts: true,
             }
         } else {
@@ -246,8 +242,8 @@ fn main() -> Result<()> {
                 eprintln!("Output directory requires --artifacts and artifact number.");
                 std::process::exit(64);
             }
-            Mode::ShowIndex {
-                index: conversation_number - 1,
+            Mode::ShowConversation {
+                id: conversation_id,
                 show_artifacts: false,
             }
         }
@@ -258,6 +254,53 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn resolve_conversation_id(
+    id_str: &str,
+    summaries: &[ConversationSummary],
+) -> Result<usize> {
+    // Try to parse as a number first
+    if let Ok(number) = id_str.parse::<usize>() {
+        if number == 0 {
+            return Err(anyhow!("Conversation number must be greater than zero."));
+        }
+        let index = number - 1;
+        if index >= summaries.len() {
+            return Err(anyhow!(
+                "Conversation number {} out of range (1..={})",
+                number,
+                summaries.len()
+            ));
+        }
+        return Ok(index);
+    }
+
+    // Otherwise, treat it as a hash (conversation ID)
+    // Try exact match first
+    for (idx, summary) in summaries.iter().enumerate() {
+        if summary.id == id_str {
+            return Ok(idx);
+        }
+    }
+
+    // Try prefix match
+    let matching: Vec<usize> = summaries
+        .iter()
+        .enumerate()
+        .filter(|(_, summary)| summary.id.starts_with(id_str))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    match matching.len() {
+        0 => Err(anyhow!("No conversation found with hash matching `{}`", id_str)),
+        1 => Ok(matching[0]),
+        _ => Err(anyhow!(
+            "Ambiguous hash `{}`: matches {} conversations",
+            id_str,
+            matching.len()
+        )),
+    }
 }
 
 fn run(export_path: &Path, mode: Mode) -> Result<()> {
@@ -298,20 +341,15 @@ fn run(export_path: &Path, mode: Mode) -> Result<()> {
             println!("{} {}", accent_bullet(), count_note);
             list_all_artifacts(export_path, &conversations, &summaries);
         }
-        Mode::ShowIndex {
-            index,
+        Mode::ShowConversation {
+            id,
             show_artifacts,
         } => {
             if summaries.is_empty() {
                 return Err(anyhow!("no conversations available"));
             }
-            let summary = summaries.get(index).ok_or_else(|| {
-                anyhow!(
-                    "conversation number {} out of range (1..={})",
-                    index + 1,
-                    summaries.len()
-                )
-            })?;
+            let index = resolve_conversation_id(&id, &summaries)?;
+            let summary = &summaries[index];
             let conversation = &conversations[summary.index];
             if show_artifacts {
                 print_conversation_artifacts(export_path, conversation, summary, false);
@@ -320,26 +358,21 @@ fn run(export_path: &Path, mode: Mode) -> Result<()> {
             }
         }
         Mode::DownloadArtifact {
-            conversation_index,
+            conversation_id,
             artifact_number,
             output_dir,
         } => {
             if summaries.is_empty() {
                 return Err(anyhow!("no conversations available"));
             }
-            let summary = summaries.get(conversation_index).ok_or_else(|| {
-                anyhow!(
-                    "conversation number {} out of range (1..={})",
-                    conversation_index + 1,
-                    summaries.len()
-                )
-            })?;
+            let conversation_index = resolve_conversation_id(&conversation_id, &summaries)?;
+            let summary = &summaries[conversation_index];
             let conversation = &conversations[summary.index];
 
             if conversation.artifacts.is_empty() {
                 return Err(anyhow!(
-                    "conversation {} has no artifacts",
-                    conversation_index + 1
+                    "conversation `{}` has no artifacts",
+                    conversation_id
                 ));
             }
 
@@ -672,11 +705,16 @@ fn print_conversation_list(summaries: &[ConversationSummary]) {
             .map(format_timestamp)
             .unwrap_or_else(|| "unknown time".to_string());
         println!(
-            "{} [{}] {} {}",
+            "{} [{}] {}",
             edge("|"),
             accent(&format!("{:>2}", ordinal + 1)),
-            summary.title,
-            dim(&format!("· {}", timestamp))
+            summary.title
+        );
+        println!(
+            "{}     {} · {}",
+            edge("|"),
+            dim(&summary.id),
+            dim(&timestamp)
         );
     }
 }
@@ -1219,11 +1257,16 @@ fn show_matches(matches: &[MatchedConversation<'_>]) -> usize {
             .map(format_timestamp)
             .unwrap_or_else(|| "unknown time".to_string());
         println!(
-            "{} [{}] {} {}",
+            "{} [{}] {}",
             edge("|"),
             accent(&format!("{:>2}", ordinal + 1)),
-            summary.title,
-            dim(&format!("· {}", timestamp))
+            summary.title
+        );
+        println!(
+            "{}     {} · {}",
+            edge("|"),
+            dim(&summary.id),
+            dim(&timestamp)
         );
     }
 
