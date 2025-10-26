@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,9 +9,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use nu_ansi_term::{Color, Style as AnsiStyle};
 use once_cell::sync::Lazy;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser as MarkdownParser, Tag};
 use serde::Deserialize;
 use serde_json::Value;
 use syntect::easy::HighlightLines;
@@ -29,6 +29,32 @@ const DOT_INACTIVE_COLOR: Color = Color::Rgb(90, 94, 104);
 const AVAILABLE_COLOR: Color = Color::Rgb(120, 200, 120);
 const UNAVAILABLE_COLOR: Color = Color::Rgb(220, 100, 100);
 const PROGRESS_FRAMES: [&str; 6] = ["●○○○○○", "●●○○○○", "●●●○○○", "●●●●○○", "●●●●●○", "●●●●●●"];
+
+/// Command-line browser for exported gen-AI conversations
+#[derive(Parser, Debug)]
+#[command(name = "convos")]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Path to the exported conversation directory
+    export_path: PathBuf,
+
+    /// Conversation number to display (1-based index)
+    conversation_number: Option<usize>,
+
+    /// List all conversations
+    #[arg(short, long, conflicts_with_all = ["artifacts"])]
+    list: bool,
+
+    /// Show or list artifacts
+    #[arg(short, long)]
+    artifacts: bool,
+
+    /// Artifact number to download (requires conversation_number and --artifacts)
+    artifact_number: Option<usize>,
+
+    /// Output directory for downloaded artifact
+    output_dir: Option<PathBuf>,
+}
 
 enum Mode {
     Interactive,
@@ -162,130 +188,72 @@ where
 }
 
 fn main() -> Result<()> {
-    let mut args = env::args_os();
-    let _ = args.next();
+    let args = Args::parse();
 
-    let Some(export_arg) = args.next() else {
-        eprintln!("Usage: convos <path-to-export> [--list|NUMBER [--artifacts [ARTIFACT_NUMBER [OUTPUT_DIR]]]]");
-        std::process::exit(64);
-    };
+    // Validate export path
+    if !args.export_path.exists() {
+        eprintln!(
+            "The provided path `{}` does not exist.",
+            args.export_path.display()
+        );
+        std::process::exit(66);
+    }
 
-    let export_path = PathBuf::from(&export_arg);
+    if !args.export_path.is_dir() {
+        eprintln!(
+            "The provided path `{}` is not a directory.",
+            args.export_path.display()
+        );
+        std::process::exit(66);
+    }
 
-    let tail_args: Vec<String> = args.map(|arg| arg.to_string_lossy().to_string()).collect();
+    // Determine mode based on arguments
+    let mode = if args.list {
+        Mode::ListOnly
+    } else if args.conversation_number.is_none() && args.artifacts {
+        Mode::ListAllArtifacts
+    } else if args.conversation_number.is_none() {
+        Mode::Interactive
+    } else {
+        let conversation_number = args.conversation_number.unwrap();
+        if conversation_number == 0 {
+            eprintln!("Conversation number must be greater than zero.");
+            std::process::exit(64);
+        }
 
-    let mode = match tail_args.as_slice() {
-        [] => Mode::Interactive,
-        [flag] if flag == "--list" => Mode::ListOnly,
-        [flag] if flag == "--artifacts" => Mode::ListAllArtifacts,
-        [flag] => {
-            let number: usize = flag.parse().unwrap_or_else(|_| {
-                eprintln!("Invalid conversation number `{}`.", flag);
+        if args.artifacts && args.artifact_number.is_some() {
+            let artifact_number = args.artifact_number.unwrap();
+            if artifact_number == 0 {
+                eprintln!("Artifact number must be greater than zero.");
                 std::process::exit(64);
-            });
-            if number == 0 {
-                eprintln!("Conversation number must be greater than zero.");
+            }
+            Mode::DownloadArtifact {
+                conversation_index: conversation_number - 1,
+                artifact_number,
+                output_dir: args.output_dir,
+            }
+        } else if args.artifacts {
+            Mode::ShowIndex {
+                index: conversation_number - 1,
+                show_artifacts: true,
+            }
+        } else {
+            if args.artifact_number.is_some() {
+                eprintln!("Artifact number requires --artifacts flag.");
+                std::process::exit(64);
+            }
+            if args.output_dir.is_some() {
+                eprintln!("Output directory requires --artifacts and artifact number.");
                 std::process::exit(64);
             }
             Mode::ShowIndex {
-                index: number - 1,
+                index: conversation_number - 1,
                 show_artifacts: false,
             }
         }
-        [number, flag] if flag == "--artifacts" => {
-            let parsed: usize = number.parse().unwrap_or_else(|_| {
-                eprintln!("Invalid conversation number `{}`.", number);
-                std::process::exit(64);
-            });
-            if parsed == 0 {
-                eprintln!("Conversation number must be greater than zero.");
-                std::process::exit(64);
-            }
-            Mode::ShowIndex {
-                index: parsed - 1,
-                show_artifacts: true,
-            }
-        }
-        [number, flag, artifact_num] if flag == "--artifacts" => {
-            let conv_index: usize = number.parse().unwrap_or_else(|_| {
-                eprintln!("Invalid conversation number `{}`.", number);
-                std::process::exit(64);
-            });
-            if conv_index == 0 {
-                eprintln!("Conversation number must be greater than zero.");
-                std::process::exit(64);
-            }
-            let artifact_number: usize = artifact_num.parse().unwrap_or_else(|_| {
-                eprintln!("Invalid artifact number `{}`.", artifact_num);
-                std::process::exit(64);
-            });
-            if artifact_number == 0 {
-                eprintln!("Artifact number must be greater than zero.");
-                std::process::exit(64);
-            }
-            Mode::DownloadArtifact {
-                conversation_index: conv_index - 1,
-                artifact_number,
-                output_dir: None,
-            }
-        }
-        [number, flag, artifact_num, output_dir] if flag == "--artifacts" => {
-            let conv_index: usize = number.parse().unwrap_or_else(|_| {
-                eprintln!("Invalid conversation number `{}`.", number);
-                std::process::exit(64);
-            });
-            if conv_index == 0 {
-                eprintln!("Conversation number must be greater than zero.");
-                std::process::exit(64);
-            }
-            let artifact_number: usize = artifact_num.parse().unwrap_or_else(|_| {
-                eprintln!("Invalid artifact number `{}`.", artifact_num);
-                std::process::exit(64);
-            });
-            if artifact_number == 0 {
-                eprintln!("Artifact number must be greater than zero.");
-                std::process::exit(64);
-            }
-            Mode::DownloadArtifact {
-                conversation_index: conv_index - 1,
-                artifact_number,
-                output_dir: Some(PathBuf::from(output_dir)),
-            }
-        }
-        [flag, ..] if flag == "--list" => {
-            eprintln!("`--list` does not accept additional arguments.");
-            eprintln!("Usage: convos <path-to-export> [--list|NUMBER [--artifacts [ARTIFACT_NUMBER [OUTPUT_DIR]]]]");
-            std::process::exit(64);
-        }
-        [flag, ..] if flag == "--artifacts" => {
-            eprintln!("`--artifacts` must follow a conversation number.");
-            eprintln!("Usage: convos <path-to-export> [--list|NUMBER [--artifacts [ARTIFACT_NUMBER [OUTPUT_DIR]]]]");
-            std::process::exit(64);
-        }
-        _ => {
-            eprintln!("Too many arguments provided.");
-            eprintln!("Usage: convos <path-to-export> [--list|NUMBER [--artifacts [ARTIFACT_NUMBER [OUTPUT_DIR]]]]");
-            std::process::exit(64);
-        }
     };
 
-    if !export_path.exists() {
-        eprintln!(
-            "The provided path `{}` does not exist.",
-            export_path.display()
-        );
-        std::process::exit(66);
-    }
-
-    if !export_path.is_dir() {
-        eprintln!(
-            "The provided path `{}` is not a directory.",
-            export_path.display()
-        );
-        std::process::exit(66);
-    }
-
-    if let Err(err) = run(&export_path, mode) {
+    if let Err(err) = run(&args.export_path, mode) {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
@@ -1820,7 +1788,7 @@ fn render_markdown(text: &str) -> String {
     let mut code_block: Option<(Option<String>, String)> = None;
 
     let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES;
-    let parser = Parser::new_ext(text, options);
+    let parser = MarkdownParser::new_ext(text, options);
 
     for event in parser {
         match event {
