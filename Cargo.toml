@@ -6,6 +6,7 @@ edition = "2024"
 [lib]
 name = "convos"
 path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
 
 [[bin]]
 name = "convos"
@@ -21,3 +22,7 @@ pulldown-cmark = { version = "0.9", default-features = false, features = ["simd"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 syntect = { version = "5", features = ["regex-onig"] }
+swift-bridge = "0.1"
+
+[build-dependencies]
+swift-bridge-build = "0.1"

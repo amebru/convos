@@ -41,6 +41,7 @@ pub mod types;
 pub mod parser;
 pub mod loader;
 pub mod render;
+pub mod ffi;
 
 // Re-export commonly used types and functions for convenience
 pub use types::{
